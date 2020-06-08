@@ -1,13 +1,23 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
+#include <FS.h>
+#include <Arduino.h>
+#include <ArduinoJson.h> 
 
-#include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
+#include <ESP8266WiFi.h>          //ESP8266 Core WiFi Library (you most likely already have this in your sketch)
 #include <WiFiUdp.h>
 
-ESP8266WiFiMulti wifiMulti;      // Create an instance of the ESP8266WiFiMulti class, called 'wifiMulti'
+#include <DNSServer.h>            //Local DNS Server used for redirecting all requests to the configuration portal
+#include <ESP8266WebServer.h>     //Local WebServer used to serve the configuration portal
+#include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 
+#include <ESP8266HTTPClient.h>
+
+#define USE_SERIAL Serial
 WiFiUDP UDP;                     // Create an instance of the WiFiUDP class to send and receive
-
 IPAddress timeServerIP;          // time.nist.gov NTP server address
 const char* NTPServerName = "time.nist.gov";
 
@@ -15,7 +25,31 @@ const int NTP_PACKET_SIZE = 48;  // NTP time stamp is in the first 48 bytes of t
 
 byte NTPBuffer[NTP_PACKET_SIZE]; // buffer to hold incoming and outgoing packets
 
+unsigned long intervalNTP = 60000; // Request NTP time every minute
+unsigned long prevNTP = 0;
+unsigned long lastNTPResponse = millis();
+uint32_t timeUNIX = 0;
 
+unsigned long prevActualTime = 0;
+
+#define OLED_RESET 0
+Adafruit_SSD1306 display(OLED_RESET);
+
+#if (SSD1306_LCDHEIGHT != 32)
+#error("Height incorrect, please fix Adafruit_SSD1306.h!");
+#endif
+
+char openweathermap_key[35];
+String openweathermap_uri = "http://api.openweathermap.org/data/2.5/weather?units=metric&id=6167865&appid=";
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
 
 uint32_t getTime() {
   if (UDP.parsePacket() == 0) { // If there's no response (yet)
@@ -54,24 +88,6 @@ inline int getHours(uint32_t UNIXTime) {
   return UNIXTime / 3600 % 24;
 }
 
-
-
-void startWiFi() { // Try to connect to some given access points. Then wait for a connection
-  wifiMulti.addAP("DEVICE", "PASSWORD");   // add Wi-Fi networks you want to connect to
-
-  Serial.println("Connecting");
-  while (wifiMulti.run() != WL_CONNECTED) {  // Wait for the Wi-Fi to connect
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println("\r\n");
-  Serial.print("Connected to ");
-  Serial.println(WiFi.SSID());             // Tell us what network we're connected to
-  Serial.print("IP address:\t");
-  Serial.print(WiFi.localIP());            // Send the IP address of the ESP8266 to the computer
-  Serial.println("\r\n");
-}
-
 void startUDP() {
   Serial.println("Starting UDP");
   UDP.begin(123);                          // Start listening for UDP messages on port 123
@@ -81,17 +97,73 @@ void startUDP() {
 }
 
 
-
 void setup() {
-  Serial.begin(115200);          // Start the Serial communication to send messages to the computer
-  delay(10);
-  Serial.println("\r\n");
 
-  startWiFi();                   // Try to connect to some given access points. Then wait for a connection
+  pinMode(LED_BUILTIN, OUTPUT);    
+  USE_SERIAL.begin(115200);
+
+    //read configuration from FS json
+  USE_SERIAL.println("mounting file system...");
+
+  if (SPIFFS.begin()) {
+      USE_SERIAL.println("mounted file system");
+      if (SPIFFS.exists("/config.json")) {
+        //file exists, reading and loading
+        USE_SERIAL.println("reading config file");
+        File configFile = SPIFFS.open("/config.json", "r");
+        if (configFile) {
+          USE_SERIAL.println("opened config file");
+          size_t size = configFile.size();
+          // Allocate a buffer to store contents of the file.
+          std::unique_ptr<char[]> buf(new char[size]);
+  
+          configFile.readBytes(buf.get(), size);
+          DynamicJsonBuffer jsonBuffer;
+          JsonObject& json = jsonBuffer.parseObject(buf.get());
+          json.printTo(Serial);
+          if (json.success()) {
+            USE_SERIAL.println("\nparsed json");
+  
+            strcpy(openweathermap_key, json["openweathermap_key"]);
+          } else {
+            USE_SERIAL.println("failed to load json config");
+          }
+        }
+      }
+    } else {
+      USE_SERIAL.println("failed to mount FS");
+    }
+
+  // The extra parameters to be configured (can be either global or just in the setup)
+  // After connecting, parameter.getValue() will get you the configured value
+  // id/name placeholder/prompt default length
+  WiFiManagerParameter custom_openweathermap_api_key("weatherapikey", "openweathermap api key", openweathermap_key, 35);
+  
+  //Locally initialized, then it's gone because we don't need it anymore.
+  WiFiManager wifiManager;
+  //set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
+  wifiManager.addParameter(&custom_openweathermap_api_key);
+
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point with the specified name
+  //here  "AutoConnectAP"
+  //and goes into a blocking loop awaiting configuration
+  if (!wifiManager.autoConnect("ESP8266-Omer", "easypassword")) {
+    USE_SERIAL.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+
+  //Blocking until WiFi AP configuration is complete
+  USE_SERIAL.println("Wifi AP configuration successful...");
 
   startUDP();
 
-  if(!WiFi.hostByName(NTPServerName, timeServerIP)) { // Get the IP address of the NTP server
+    if(!WiFi.hostByName(NTPServerName, timeServerIP)) { // Get the IP address of the NTP server
     Serial.println("DNS lookup failed. Rebooting.");
     Serial.flush();
     ESP.reset();
@@ -100,25 +172,124 @@ void setup() {
   Serial.println(timeServerIP);
   
   Serial.println("\r\nSending NTP request ...");
-  sendNTPpacket(timeServerIP);  
+  sendNTPpacket(timeServerIP); 
+
+  //read custom parameters
+      USE_SERIAL.print("openweathermap_key before strcpy=> ");
+      USE_SERIAL.println(strlen(openweathermap_key));
+      USE_SERIAL.println(openweathermap_key);
+      strcpy(openweathermap_key, custom_openweathermap_api_key.getValue());
+      USE_SERIAL.println("openweathermap_key after strcpy=>");
+      USE_SERIAL.println(openweathermap_key);
+      USE_SERIAL.println(strlen(openweathermap_key));
+
+    if(strlen(openweathermap_key) != 32){
+      wifiManager.resetSettings();
+      shouldSaveConfig = false;
+      USE_SERIAL.println(openweathermap_key);
+      USE_SERIAL.println(strlen(openweathermap_key));
+    }
+
+    //save the custom parameters to FS
+    if (shouldSaveConfig) {
+      Serial.println("saving config");
+      DynamicJsonBuffer jsonBuffer;
+      JsonObject& json = jsonBuffer.createObject();
+      json["openweathermap_key"] = openweathermap_key;
+  
+      File configFile = SPIFFS.open("/config.json", "w");
+      if (!configFile) {
+        Serial.println("failed to open config file for writing");
+      }
+  
+      json.printTo(Serial);
+      json.printTo(configFile);
+      configFile.close();
+      //end save
+    }
+
+    USE_SERIAL.println("local ip ");
+    USE_SERIAL.println(WiFi.localIP());
+
+    openweathermap_uri = openweathermap_uri + openweathermap_key;
+
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+    display.clearDisplay();
+      // draw a white circle, 10 pixel radius
+    display.fillCircle(display.width()/2, display.height()/2, 10, WHITE);
+    display.display();
+    delay(2000);
+    display.clearDisplay();
 }
-
-
-
-unsigned long intervalNTP = 60000; // Request NTP time every minute
-unsigned long prevNTP = 0;
-unsigned long lastNTPResponse = millis();
-uint32_t timeUNIX = 0;
-
-unsigned long prevActualTime = 0;
 
 void loop() {
   unsigned long currentMillis = millis();
-
+  display.clearDisplay();
   if (currentMillis - prevNTP > intervalNTP) { // If a minute has passed since last NTP request
     prevNTP = currentMillis;
     Serial.println("\r\nSending NTP request ...");
     sendNTPpacket(timeServerIP);               // Send an NTP request
+
+        HTTPClient http;
+    
+    digitalWrite(LED_BUILTIN, HIGH); 
+    USE_SERIAL.println("[HTTP] begin...");
+    // configure traged server and url
+    http.begin(openweathermap_uri); //HTTP
+
+    USE_SERIAL.println("[HTTP] GET...");
+    // start connection and send HTTP header
+    int httpCode = http.GET();
+
+    // httpCode will be negative on error
+    if (httpCode > 0) {
+      // HTTP header has been send and Server response header has been handled
+      USE_SERIAL.printf("[HTTP] GET... code: %d", httpCode);
+      // file found at server
+      if (httpCode == HTTP_CODE_OK) {
+        DynamicJsonBuffer jsonBuffer;
+        digitalWrite(LED_BUILTIN, LOW);
+        String response = http.getString();
+        
+        const char* json = response.c_str();
+//      response.toCharArray(json);
+        JsonObject& root = jsonBuffer.parseObject(json);
+        
+         if (!root.success()) {
+          Serial.println("parseObject() failed");
+          return;
+        } else {
+          
+          JsonObject& weather0 = root["weather"][0];
+          const char* weather0_main = weather0["main"];
+          const char* weather0_description = weather0["description"];
+          USE_SERIAL.println(weather0_main);
+          
+          JsonObject& main = root["main"];
+          const char* main_temp = main["temp"];
+          const char* main_temp_min = main["temp_min"]; // 4
+          const char* main_temp_max = main["temp_max"];
+          USE_SERIAL.println(main_temp);
+
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setTextColor(WHITE);
+          display.setCursor(0,0);
+          display.printf("Current %sC\n", main_temp);
+          display.printf("High %sC - Low %sC\n", main_temp_max, main_temp_min);                    
+          display.printf("%s\n", weather0_main);
+          display.printf("%s\n", weather0_description);
+          display.display();
+  
+        }
+        digitalWrite(LED_BUILTIN, HIGH); 
+      }
+    } else {
+      USE_SERIAL.printf("[HTTP] GET... failed, error: %s", http.errorToString(httpCode).c_str());
+    }
+
+    
+    http.end();
   }
 
   uint32_t time = getTime();                   // Check if an NTP response has arrived and get the (UNIX) time
@@ -138,5 +309,5 @@ void loop() {
     prevActualTime = actualTime;
     Serial.printf("\rUTC time:\t%d:%d:%d   ", getHours(actualTime), getMinutes(actualTime), getSeconds(actualTime));
   }  
+  
 }
-
